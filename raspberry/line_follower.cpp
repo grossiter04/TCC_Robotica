@@ -1,17 +1,15 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <opencv2/opencv.hpp>
-// --- INCLUSÕES PARA A PORTA SERIAL ---
-#include <fcntl.h>   // Para controle de arquivos (serial port)
-#include <termios.h> // Para configuração da serial
-#include <unistd.h>  // Para read/write/close
+#include <fcntl.h>   
+#include <termios.h> 
+#include <unistd.h>  
 
 // --- FUNÇÕES AUXILIARES PARA A SERIAL ---
 
-// Função para configurar e abrir a porta serial no Linux
 int abrirPortaSerial(const char* portname) {
-    // Abre a porta serial. O_RDWR = Leitura/Escrita. O_NOCTTY = Não se torna o terminal de controle.
     int fd = open(portname, O_RDWR | O_NOCTTY | O_SYNC);
     if (fd < 0) {
         std::cerr << "Erro ao abrir a porta serial: " << portname << std::endl;
@@ -24,11 +22,9 @@ int abrirPortaSerial(const char* portname) {
         return -1;
     }
 
-    // Define a velocidade da porta (Baud Rate) para 9600
     cfsetospeed(&tty, B9600);
     cfsetispeed(&tty, B9600);
 
-    // Configurações da porta: 8 bits de dados, sem paridade, 1 stop bit
     tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
     tty.c_iflag &= ~IGNBRK;
     tty.c_lflag = 0;
@@ -41,7 +37,6 @@ int abrirPortaSerial(const char* portname) {
     tty.c_cflag &= ~CSTOPB;
     tty.c_cflag &= ~CRTSCTS;
 
-    // Aplica as configurações
     if (tcsetattr(fd, TCSANOW, &tty) != 0) {
         std::cerr << "Erro ao setar atributos da serial" << std::endl;
         return -1;
@@ -49,19 +44,18 @@ int abrirPortaSerial(const char* portname) {
     return fd;
 }
 
-// Função para enviar um comando (um único caractere)
-void enviarComando(int serial_port, char comando) {
-    write(serial_port, &comando, 1); // Escreve 1 byte (o caractere) na porta
+void enviarVelocidades(int serial_port, int velEsq, int velDir) {
+    std::string comando = std::to_string(velEsq) + "," + std::to_string(velDir) + "\n";
+    write(serial_port, comando.c_str(), comando.length());
 }
 
 // --- FIM DAS FUNÇÕES DA SERIAL ---
 
-// Função para encontrar o maior contorno (não muda)
 int encontrarMaiorContorno(const std::vector<std::vector<cv::Point>>& contours) {
     if (contours.empty()) return -1;
     double maxArea = 0.0;
     int largestContourIndex = -1;
-    for (int i = 0; i < contours.size(); i++) {
+    for (int i = 0; i < (int)contours.size(); i++) {
         double area = cv::contourArea(contours[i]);
         if (area > maxArea) {
             maxArea = area;
@@ -71,22 +65,18 @@ int encontrarMaiorContorno(const std::vector<std::vector<cv::Point>>& contours) 
     return largestContourIndex;
 }
 
-
 int main() {
     // --- CONFIGURAÇÃO DA PORTA SERIAL ---
-    // ATUALIZADO com a porta que você descobriu!
     const char* porta_serial_nome = "/dev/ttyUSB0"; 
     
     int serial_port = abrirPortaSerial(porta_serial_nome);
     if (serial_port < 0) {
         std::cerr << "Nao foi possivel conectar ao Arduino. Verifique a porta." << std::endl;
-        std::cerr << "Dica: Voce rodou 'sudo usermod -a -G dialout seu_usuario'?" << std::endl;
         return -1; 
     }
     std::cout << "Conectado ao Arduino na porta " << porta_serial_nome << std::endl;
-    // ------------------------------------
 
-    // --- CONFIGURAÇÃO DA CÂMERA DA PI ---
+    // --- CONFIGURAÇÃO DA CÂMERA ---
     std::string pipeline = "libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 ! videoconvert ! appsink";
     cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
 
@@ -98,17 +88,31 @@ int main() {
     // --- PARÂMETROS DE VISÃO ---
     int limiar_threshold = 150;      
     int tamanho_kernel_blur = 7;     
-    double area_minima_contorno = 1000.0; 
-    double altura_roi_percentual = 0.4; 
+    double altura_roi_percentual = 1; 
 
-    //Caso queira ver a janela da camera, tirar o comentario das duas linhas de cv::nameWindow
+    // --- PARÂMETROS DO CONTROLE PD ---
+    float Kp = 0.5;   // Ganho Proporcional: reage ao erro atual.
+                      // Aumentar = reage mais forte, mas pode oscilar.
+    
+    float Kd = 0; // Ganho Derivativo: reage à VARIAÇÃO do erro.
+                      // Aumentar = amortece mais as oscilações.
+                      // Diminuir = menos amortecimento.
+                      // DICA: comece com Kd entre 1x e 3x o valor de Kp.
 
-    // Cria as janelas (VNC irá mostrá-las se você estiver conectado)
-    //cv::namedWindow("Video da Pista", cv::WINDOW_NORMAL);
-    //cv::namedWindow("Mascara Branca (Threshold)", cv::WINDOW_NORMAL);
+    int velocidade_base = 130;   // Velocidade em linha reta (0-255)
+    
+    // --- VARIÁVEL DE MEMÓRIA DO ERRO ANTERIOR (essencial para o Kd) ---
+    int erro_anterior = 0;
 
-    std::cout << "Pressione 'q' para sair." << std::endl;
-    std::string lastDirection = "";
+    int ultima_vel_esq =
+     -1;
+    int ultima_vel_dir = -1;
+
+    std::cout << "Iniciando Controle PD. Pressione 'q' para sair." << std::endl;
+
+    // --- CRIAÇÃO DAS JANELAS DE VISUALIZAÇÃO ---
+    cv::namedWindow("Visao do Robo (Colorida)", cv::WINDOW_AUTOSIZE);
+    cv::namedWindow("Mascara (Preto e Branco)", cv::WINDOW_AUTOSIZE);
 
     // --- LOOP PRINCIPAL ---
     while (true) {
@@ -125,7 +129,7 @@ int main() {
         cv::Rect roi_rect(0, height * (1 - altura_roi_percentual), width, height * altura_roi_percentual);
         cv::Mat roi = frame(roi_rect);
 
-        // Processamento da imagem (só na ROI)
+        // Processamento da imagem
         cv::Mat gray, blurred, thresh;
         cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
         cv::GaussianBlur(gray, blurred, cv::Size(tamanho_kernel_blur, tamanho_kernel_blur), 0);
@@ -134,53 +138,101 @@ int main() {
         std::vector<std::vector<cv::Point>> contours;
         cv::findContours(thresh, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
 
-        std::string direction = "Procurando linha...";
-        char comando_serial = 'P'; // Comando 'P' para Parar (default)
-
         int largestContourIndex = encontrarMaiorContorno(contours);
         
+        int erro = 0;
+        float ajuste = 0;
+        int vel_esquerda = 0;
+        int vel_direita = 0;
+        std::string status = "Parado (Sem linha)";
+
         if (largestContourIndex != -1) {
             cv::Moments M = cv::moments(contours[largestContourIndex]);
             if (M.m00 != 0) {
                 cv::Point2f center_roi(M.m10 / M.m00, M.m01 / M.m00);
                 cv::Point2f center_frame = center_roi + cv::Point2f(roi_rect.x, roi_rect.y);
-                int limite_esquerda = width / 3;
-                int limite_direita = 2 * (width / 3);
                 
-                // --- MAPEAMENTO DE DIREÇÃO PARA COMANDO SERIAL ---
-                if (center_roi.x < limite_esquerda) {
-                    direction = "Virar a Esquerda";
-                    comando_serial = 'L'; // 'L' para Esquerda
-                } else if (center_roi.x > limite_direita) {
-                    direction = "Virar a Direita";
-                    comando_serial = 'R'; // 'R' para Direita
-                } else {
-                    direction = "Em Frente";
-                    comando_serial = 'F'; // 'F' para Frente
-                }
+                // =========================================================
+                // --- CÁLCULO DO CONTROLE PD ---
+                // =========================================================
+
+                int setPoint = width / 2;
+
+                // 1. TERMO PROPORCIONAL (P):
+                //    Mede o erro ATUAL (distância do centro até a linha).
+                //    Quanto maior o erro, maior a correção.
+                erro = setPoint - (int)center_roi.x;
+
                 
-                // Desenha na imagem original (frame)
+                // 2. TERMO DERIVATIVO (D):
+                //    Mede a VARIAÇÃO do erro entre o frame atual e o anterior.
+                //    Se o erro está aumentando rápido (robô se afastando da linha),
+                //    o Kd "freia" a correção, evitando oscilações e ultrapassagens.
+                //    Se o erro está diminuindo (robô voltando para a linha),
+                //    o Kd "afrouxa" a correção suavemente.
+                int derivada = erro - erro_anterior;
+
+                // 3. AJUSTE TOTAL (PD):
+                //    A correção final é a soma dos dois termos.
+                ajuste = (Kp * erro) + (Kd * derivada);
+
+                // 4. APLICA O AJUSTE NAS VELOCIDADES DOS MOTORES:
+                //    Motor esquerdo recebe MENOS velocidade quando o robô
+                //    precisa virar à esquerda (erro positivo), e vice-versa.
+                vel_esquerda = velocidade_base - (int)ajuste;
+                vel_direita  = velocidade_base + (int)ajuste;
+                
+                // Limita as velocidades entre 100 e 255
+                vel_esquerda = std::max(100, std::min(255, vel_esquerda));
+                vel_direita  = std::max(100, std::min(255, vel_direita));
+
+                // 5. ATUALIZA O ERRO ANTERIOR para o próximo frame
+                erro_anterior = erro;
+
+                // =========================================================
+
+                status = "Esq: " + std::to_string(vel_esquerda) + " | Dir: " + std::to_string(vel_direita);
+                
+                // Desenhos na tela
                 cv::drawContours(frame, contours, largestContourIndex, cv::Scalar(0, 255, 0), 2, cv::LINE_8, {}, 0, cv::Point(roi_rect.x, roi_rect.y));
                 cv::circle(frame, center_frame, 7, cv::Scalar(0, 0, 255), -1);
+                cv::line(frame, cv::Point(setPoint, 0), cv::Point(setPoint, height), cv::Scalar(255, 255, 0), 1);
             }
+        } else {
+            // Linha perdida: para os motores e ZERA o erro anterior
+            // para evitar uma derivada falsa no próximo frame que
+            // detectar a linha.
+            vel_esquerda = 0;
+            vel_direita = 0;
+            erro_anterior = 0;
         }
         
-        // Desenha a caixa da ROI e o texto
+        // --- ENVIAR COMANDO SERIAL ---
+        if (vel_esquerda != ultima_vel_esq || vel_direita != ultima_vel_dir) {
+            enviarVelocidades(serial_port, vel_esquerda, vel_direita);
+            
+            if (largestContourIndex != -1) {
+                int derivada_print = erro - erro_anterior; // Para exibição
+                std::cout << "[Kp:" << Kp << " Kd:" << Kd << "]"
+                          << " Erro: " << erro 
+                          << " | Derivada: " << (erro - erro_anterior)
+                          << " | Ajuste: " << ajuste 
+                          << " ==> Motores(Esq: " << vel_esquerda 
+                          << ", Dir: " << vel_direita << ")" << std::endl;
+            } else {
+                std::cout << "[Alerta] Linha perdida! ==> Parando motores (0, 0)" << std::endl;
+            }
+
+            ultima_vel_esq = vel_esquerda;
+            ultima_vel_dir = vel_direita;
+        }
+
+        // Desenha a caixa da ROI e o texto de status
         cv::rectangle(frame, roi_rect, cv::Scalar(255, 0, 0), 2); 
-        cv::putText(frame, direction, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
+        cv::putText(frame, status, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
 
-        // --- ENVIAR COMANDO SERIAL APENAS QUANDO A DIREÇÃO MUDAR ---
-        if (direction != lastDirection) {
-            std::cout << "Nova Direcao: " << direction << " (Enviando: " << comando_serial << ")" << std::endl;
-            enviarComando(serial_port, comando_serial); // Envia o comando para o Arduino
-            lastDirection = direction;
-        }
-
-        //Se quiser ver a janela da camera, tirar os comentarios de cv::imShow
-        
-        // Mostra as imagens (visível se você usar um VNC)
-        //cv::imshow("Video da Pista", frame);
-        //cv::imshow("Mascara Branca (Threshold)", thresh);
+        cv::imshow("Visao do Robo (Colorida)", frame);
+        cv::imshow("Mascara (Preto e Branco)", thresh);
 
         if (cv::waitKey(30) == 'q') {
             break;
@@ -188,12 +240,10 @@ int main() {
     }
 
     // --- LIMPEZA ---
+    enviarVelocidades(serial_port, 0, 0); 
     cap.release();
-
-    //Se quiser ver a janela da camera, tirar o comentario de cv::destroyAllWindows
-    
-    //cv::destroyAllWindows();
-    close(serial_port); // Fecha a porta serial
+    cv::destroyAllWindows();
+    close(serial_port); 
 
     return 0;
 }
