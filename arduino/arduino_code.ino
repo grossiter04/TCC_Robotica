@@ -11,7 +11,7 @@
 const int pinoMotorEsquerdoA = 5;  // (L9110 A-1A) - PWM
 const int pinoMotorEsquerdoB = 6;  // (L9110 A-1B) - Direção
 const int pinoMotorDireitoA = 9;   // (L9110 B-1A) - PWM
-const int pinoMotorDireitoB = 10;  // (L9110 B-1B) - Direção
+const int pinoMotorDireitoB = 10;  // (L9110 B-2A) - Direção
 
 void setup() {
   pinMode(pinoMotorEsquerdoA, OUTPUT);

@@ -2,10 +2,61 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <fstream>       // Para leitura do arquivo de config
 #include <opencv2/opencv.hpp>
 #include <fcntl.h>   
 #include <termios.h> 
 #include <unistd.h>  
+
+// --- CAMINHO DO ARQUIVO DE CONFIG (compartilhado com server.py) ---
+const std::string CONFIG_PATH = "/home/gabriel/Desktop/TCC/raspberry/buzzline_config.json";
+
+// --- STRUCT DE CONFIGURAÇÃO PD ---
+struct PdConfig {
+    float kp             = 0.5f;
+    float kd             = 0.0f;
+    int   velocidade_base = 130;
+    int   vel_min        = 100;
+    int   vel_max        = 255;
+};
+
+// --- PARSER JSON MINIMALISTA ---
+// Lê apenas valores simples do tipo "chave": valor (sem dependência de lib externa)
+float extrairFloat(const std::string& json, const std::string& chave) {
+    std::string busca = "\"" + chave + "\"";
+    size_t pos = json.find(busca);
+    if (pos == std::string::npos) return -1;
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return -1;
+    return std::stof(json.substr(pos + 1));
+}
+
+PdConfig lerConfig() {
+    PdConfig cfg;
+    std::ifstream f(CONFIG_PATH);
+    if (!f.is_open()) return cfg; // Retorna padrões se não encontrar o arquivo
+
+    std::string json((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+
+    try {
+        float kp = extrairFloat(json, "kp");
+        float kd = extrairFloat(json, "kd");
+        float vb = extrairFloat(json, "velocidade_base");
+        float vm = extrairFloat(json, "vel_min");
+        float vx = extrairFloat(json, "vel_max");
+
+        if (kp >= 0) cfg.kp              = kp;
+        if (kd >= 0) cfg.kd              = kd;
+        if (vb >= 0) cfg.velocidade_base = (int)vb;
+        if (vm >= 0) cfg.vel_min         = (int)vm;
+        if (vx >= 0) cfg.vel_max         = (int)vx;
+    } catch (...) {
+        std::cerr << "[Config] Erro ao parsear JSON, usando valores anteriores." << std::endl;
+    }
+
+    return cfg;
+}
 
 // --- FUNÇÕES AUXILIARES PARA A SERIAL ---
 
@@ -85,30 +136,26 @@ int main() {
         return -1;
     }
 
-    // --- PARÂMETROS DE VISÃO ---
-    int limiar_threshold = 150;      
-    int tamanho_kernel_blur = 7;     
-    double altura_roi_percentual = 1; 
+    // --- PARÂMETROS DE VISÃO (fixos — não mudam em tempo real) ---
+    int limiar_threshold     = 150;      
+    int tamanho_kernel_blur  = 7;     
+    double altura_roi_percentual = 0.4;
 
-    // --- PARÂMETROS DO CONTROLE PD ---
-    float Kp = 0.5;   // Ganho Proporcional: reage ao erro atual.
-                      // Aumentar = reage mais forte, mas pode oscilar.
-    
-    float Kd = 0; // Ganho Derivativo: reage à VARIAÇÃO do erro.
-                      // Aumentar = amortece mais as oscilações.
-                      // Diminuir = menos amortecimento.
-                      // DICA: comece com Kd entre 1x e 3x o valor de Kp.
+    // --- CARREGA CONFIG INICIAL ---
+    PdConfig cfg = lerConfig();
+    std::cout << "[Config] Kp=" << cfg.kp 
+              << " Kd=" << cfg.kd 
+              << " Base=" << cfg.velocidade_base
+              << " Min=" << cfg.vel_min << std::endl;
 
-    int velocidade_base = 130;   // Velocidade em linha reta (0-255)
-    
-    // --- VARIÁVEL DE MEMÓRIA DO ERRO ANTERIOR (essencial para o Kd) ---
+    // --- VARIÁVEIS DE CONTROLE ---
     int erro_anterior = 0;
-
-    int ultima_vel_esq =
-     -1;
+    int ultima_vel_esq = -1;
     int ultima_vel_dir = -1;
+    int frame_counter  = 0;  // Para releitura periódica do config
 
     std::cout << "Iniciando Controle PD. Pressione 'q' para sair." << std::endl;
+    std::cout << "Ajuste os parametros em http://<IP-da-Raspberry>:5000" << std::endl;
 
     // --- CRIAÇÃO DAS JANELAS DE VISUALIZAÇÃO ---
     cv::namedWindow("Visao do Robo (Colorida)", cv::WINDOW_AUTOSIZE);
@@ -116,13 +163,38 @@ int main() {
 
     // --- LOOP PRINCIPAL ---
     while (true) {
+        // =========================================================
+        // --- RELEITURA DO CONFIG A CADA 30 FRAMES (~1 segundo) ---
+        // =========================================================
+        if (frame_counter % 30 == 0) {
+            PdConfig novo_cfg = lerConfig();
+
+            // Detecta e loga mudanças
+            if (novo_cfg.kp != cfg.kp || novo_cfg.kd != cfg.kd ||
+                novo_cfg.velocidade_base != cfg.velocidade_base ||
+                novo_cfg.vel_min != cfg.vel_min) {
+                
+                std::cout << "[Config Atualizado] "
+                          << "Kp: " << cfg.kp << " -> " << novo_cfg.kp << " | "
+                          << "Kd: " << cfg.kd << " -> " << novo_cfg.kd << " | "
+                          << "Base: " << cfg.velocidade_base << " -> " << novo_cfg.velocidade_base << " | "
+                          << "Min: " << cfg.vel_min << " -> " << novo_cfg.vel_min << std::endl;
+                
+                cfg = novo_cfg;
+                // Zera o erro anterior ao trocar parâmetros para evitar
+                // derivadas artificiais causadas pela mudança abrupta de Kd
+                erro_anterior = 0;
+            }
+        }
+        frame_counter++;
+
         cv::Mat frame;
         if (!cap.read(frame)) {
             std::cout << "Fim do video ou erro na leitura." << std::endl;
             break;
         }
 
-        int width = frame.cols;
+        int width  = frame.cols;
         int height = frame.rows;
 
         // Define a Região de Interesse (ROI)
@@ -140,10 +212,11 @@ int main() {
 
         int largestContourIndex = encontrarMaiorContorno(contours);
         
-        int erro = 0;
-        float ajuste = 0;
-        int vel_esquerda = 0;
-        int vel_direita = 0;
+        int   erro         = 0;
+        int   derivada     = 0;
+        float ajuste       = 0;
+        int   vel_esquerda = 0;
+        int   vel_direita  = 0;
         std::string status = "Parado (Sem linha)";
 
         if (largestContourIndex != -1) {
@@ -158,35 +231,24 @@ int main() {
 
                 int setPoint = width / 2;
 
-                // 1. TERMO PROPORCIONAL (P):
-                //    Mede o erro ATUAL (distância do centro até a linha).
-                //    Quanto maior o erro, maior a correção.
+                // 1. TERMO PROPORCIONAL
                 erro = setPoint - (int)center_roi.x;
 
-                
-                // 2. TERMO DERIVATIVO (D):
-                //    Mede a VARIAÇÃO do erro entre o frame atual e o anterior.
-                //    Se o erro está aumentando rápido (robô se afastando da linha),
-                //    o Kd "freia" a correção, evitando oscilações e ultrapassagens.
-                //    Se o erro está diminuindo (robô voltando para a linha),
-                //    o Kd "afrouxa" a correção suavemente.
-                int derivada = erro - erro_anterior;
+                // 2. TERMO DERIVATIVO
+                derivada = erro - erro_anterior;
 
-                // 3. AJUSTE TOTAL (PD):
-                //    A correção final é a soma dos dois termos.
-                ajuste = (Kp * erro) + (Kd * derivada);
+                // 3. AJUSTE TOTAL (usa cfg lido dinamicamente)
+                ajuste = (cfg.kp * erro) + (cfg.kd * derivada);
 
-                // 4. APLICA O AJUSTE NAS VELOCIDADES DOS MOTORES:
-                //    Motor esquerdo recebe MENOS velocidade quando o robô
-                //    precisa virar à esquerda (erro positivo), e vice-versa.
-                vel_esquerda = velocidade_base - (int)ajuste;
-                vel_direita  = velocidade_base + (int)ajuste;
-                
-                // Limita as velocidades entre 100 e 255
-                vel_esquerda = std::max(100, std::min(255, vel_esquerda));
-                vel_direita  = std::max(100, std::min(255, vel_direita));
+                // 4. APLICA NAS VELOCIDADES
+                vel_esquerda = cfg.velocidade_base - (int)ajuste;
+                vel_direita  = cfg.velocidade_base + (int)ajuste;
 
-                // 5. ATUALIZA O ERRO ANTERIOR para o próximo frame
+                // Limita com vel_min e vel_max do config
+                vel_esquerda = std::max(cfg.vel_min, std::min(cfg.vel_max, vel_esquerda));
+                vel_direita  = std::max(cfg.vel_min, std::min(cfg.vel_max, vel_direita));
+
+                // 5. ATUALIZA ERRO ANTERIOR
                 erro_anterior = erro;
 
                 // =========================================================
@@ -199,11 +261,8 @@ int main() {
                 cv::line(frame, cv::Point(setPoint, 0), cv::Point(setPoint, height), cv::Scalar(255, 255, 0), 1);
             }
         } else {
-            // Linha perdida: para os motores e ZERA o erro anterior
-            // para evitar uma derivada falsa no próximo frame que
-            // detectar a linha.
-            vel_esquerda = 0;
-            vel_direita = 0;
+            vel_esquerda  = 0;
+            vel_direita   = 0;
             erro_anterior = 0;
         }
         
@@ -212,13 +271,12 @@ int main() {
             enviarVelocidades(serial_port, vel_esquerda, vel_direita);
             
             if (largestContourIndex != -1) {
-                int derivada_print = erro - erro_anterior; // Para exibição
-                std::cout << "[Kp:" << Kp << " Kd:" << Kd << "]"
-                          << " Erro: " << erro 
-                          << " | Derivada: " << (erro - erro_anterior)
+                std::cout << "[Kp:" << cfg.kp << " Kd:" << cfg.kd << "]"
+                          << " Erro: "     << erro 
+                          << " | Deriv: "  << derivada
                           << " | Ajuste: " << ajuste 
                           << " ==> Motores(Esq: " << vel_esquerda 
-                          << ", Dir: " << vel_direita << ")" << std::endl;
+                          << ", Dir: "             << vel_direita << ")" << std::endl;
             } else {
                 std::cout << "[Alerta] Linha perdida! ==> Parando motores (0, 0)" << std::endl;
             }
@@ -228,8 +286,13 @@ int main() {
         }
 
         // Desenha a caixa da ROI e o texto de status
+        // Exibe também os parâmetros atuais no canto superior direito
         cv::rectangle(frame, roi_rect, cv::Scalar(255, 0, 0), 2); 
         cv::putText(frame, status, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+
+        std::string params_str = "Kp:" + std::to_string(cfg.kp).substr(0,4)
+                               + " Kd:" + std::to_string(cfg.kd).substr(0,4);
+        cv::putText(frame, params_str, cv::Point(width - 200, 30), cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(200, 200, 0), 1);
 
         cv::imshow("Visao do Robo (Colorida)", frame);
         cv::imshow("Mascara (Preto e Branco)", thresh);
